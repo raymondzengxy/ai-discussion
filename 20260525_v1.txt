@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# V18c LOYO-CV with robust Makou NC finding + No ratioRS1G
+# =========================================================
+
+import os
+import time
+import warnings
+from copy import deepcopy
+import joblib
+import numpy as np
+import pandas as pd
+import xarray as xr
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+import xgboost as xgb
+import lightgbm as lgb
+from catboost import CatBoostRegressor
+
+warnings.filterwarnings('ignore')
+plt.rcParams['figure.dpi'] = 140
+plt.rcParams['savefig.dpi'] = 220
+plt.rcParams['axes.unicode_minus'] = False
+
+# ==========================================
+# Config
+# ==========================================
+VERSION = "v18c"
+RANDOM_STATE = 42
+EPS = 1e-6
+TARGET = 'SS'
+
+BASE_DIR_20260520 = "/public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1"
+BASE_DIR_20260518 = "/public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260518_v1"
+BASE_DIR = BASE_DIR_20260520
+OUTPUT_DIR = os.path.join(BASE_DIR, "inversion_v18c_loyo_no_ratioRS1G")
+
+CSV_CANDIDATES = [
+    os.path.join(BASE_DIR_20260520, "matched_data_20172024_CV_filtered_v18.csv"),
+    os.path.join(BASE_DIR_20260520, "matched_data_20172023_CV_filtered_v18.csv"),
+    os.path.join(BASE_DIR_20260518, "inversion_v13_multimodel", "matched_data_20172023_CV_filtered_v13.csv"),
+]
+
+# ==========================================
+# MAKOU DISCHARGE FILES (Fill these in!)
+# ==========================================
+# If you know the exact paths, paste them here:
+
+
+# MAKOU_DATE_NC = "" 
+# MAKOU_DISCHARGE_NC = ""
+DISCHARGE_DIR = "/public/zengxiyuan/data/PRE/all-nc-discharge-sand-2006-2022/discharge-2006-2022-nc"
+MAKOU_DATE_NC = os.path.join(DISCHARGE_DIR, "makou-date-2006-2023.nc")
+MAKOU_DISCHARGE_NC = os.path.join(DISCHARGE_DIR, "makou-discharge-2006-2023.nc")
+
+# If paths above are empty, script will search recursively in this directory:
+MAKOU_SEARCH_DIR = "/public1/zengxiyuan/hima/HKEPB/data-extracted-zxy"
+MATLAB_EPOCH_OFFSET = 719529
+
+MODEL_ORDER = ['RandomForest', 'XGBoost', 'LightGBM', 'CatBoost', 'SVR']
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ==========================================
+# Basic helpers
+# ==========================================
+def choose_existing_path(candidates):
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"No CSV found in candidates: {','.join(candidates)}")
+
+def rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def mae(y_true, y_pred):
+    return float(mean_absolute_error(y_true, y_pred))
+
+def safe_r2(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if len(y_true) < 2: return np.nan
+    if np.nanstd(y_true) == 0: return np.nan
+    return float(r2_score(y_true, y_pred))
+
+def clip_nonnegative(x):
+    x = np.asarray(x, dtype=float)
+    return np.clip(x, 0, None)
+
+def ensure_datetime(df, col='Date'):
+    if col not in df.columns:
+        raise KeyError(f"Missing required column: {col}")
+    df[col] = pd.to_datetime(df[col], errors='coerce')
+    return df
+
+# ==========================================
+# Column handling
+# ==========================================
+def standardize_reflectance_columns(df):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    
+    rename_map = {
+        'rho_rc Blue': 'rhorc_Blue', 'rho_rc_Blue': 'rhorc_Blue',
+        'rho_rc Green': 'rhorc_Green', 'rho_rc_Green': 'rhorc_Green',
+        'rho_rc Red': 'rhorc_Red', 'rho_rc_Red': 'rhorc_Red',
+        'rho_rc SWIR1': 'rhorc_SWIR1', 'rho_rc_SWIR1': 'rhorc_SWIR1',
+        'Rrs_Blue': 'Rrs_Blue', 'Rrs_Green': 'Rrs_Green',
+        'Rrs_Red': 'Rrs_Red', 'Rrs_SWIR1': 'Rrs_SWIR1',
+    }
+    existing_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    if existing_map:
+        df = df.rename(columns=existing_map)
+        
+    if 'date' in df.columns and 'Date' not in df.columns:
+        df = df.rename(columns={'date': 'Date'})
+    return df
+
+def find_swir1_column(df):
+    normalized = {c: c.lower().replace(' ', '').replace('_', '').replace('.', '').replace('-', '') for c in df.columns}
+    swir_candidates = []
+    for c, key in normalized.items():
+        if ('rhorc' in key and 'swir1' in key) or ('rhorc' in key and '1610' in key) or ('rhorc' in key and '1606' in key):
+            swir_candidates.append(c)
+    
+    if not swir_candidates:
+        return None, []
+    
+    if 'rhorc_SWIR1' in df.columns:
+        base_col = 'rhorc_SWIR1'
+    else:
+        base_col = swir_candidates[0]
+    return base_col, swir_candidates
+
+def unify_swir1_column(df):
+    df = df.copy()
+    base_col, swir_candidates = find_swir1_column(df)
+    
+    if base_col is None:
+        raise KeyError("Cannot find SWIR1 reflectance column (e.g. rhorc_SWIR1 / rhorc_1610 / rhorc_1606).")
+        
+    series = pd.to_numeric(df[base_col], errors='coerce').copy()
+    for c in swir_candidates:
+        if c == base_col: continue
+        series = series.combine_first(pd.to_numeric(df[c], errors='coerce'))
+        
+    df['rhorc_SWIR1'] = series
+    return df
+
+def collapse_duplicate_columns(df):
+    df = df.copy()
+    df = df.loc[:, ~df.columns.duplicated()]
+    return df
+
+# ==========================================
+# Makou Qlag rebuild
+# ==========================================
+def find_makou_files():
+    date_nc = MAKOU_DATE_NC
+    discharge_nc = MAKOU_DISCHARGE_NC
+    
+    if date_nc and os.path.exists(date_nc) and discharge_nc and os.path.exists(discharge_nc):
+        return date_nc, discharge_nc
+
+    print(f"Searching for Makou NC files in {MAKOU_SEARCH_DIR}...")
+    for root, dirs, files in os.walk(MAKOU_SEARCH_DIR):
+        for f in files:
+            file_lower = f.lower()
+            if f.endswith('.nc') and 'makou' in file_lower:
+                full_path = os.path.join(root, f)
+                if 'date' in file_lower:
+                    date_nc = full_path
+                elif 'discharge' in file_lower or 'flow' in file_lower or 'q' in file_lower:
+                    discharge_nc = full_path
+
+    if not date_nc or not discharge_nc:
+        error_msg = (
+            f"Cannot locate Makou NC files automatically in {MAKOU_SEARCH_DIR}.\n"
+            f"Please run `find {MAKOU_SEARCH_DIR} -name '*makou*.nc'`\n"
+            f"and paste the absolute paths into MAKOU_DATE_NC and MAKOU_DISCHARGE_NC at the top of the script."
+        )
+        raise FileNotFoundError(error_msg)
+        
+    print(f"Found Date NC: {date_nc}")
+    print(f"Found Discharge NC: {discharge_nc}")
+    return date_nc, discharge_nc
+
+
+def load_makou_qlag():
+    print("CSV lacks Qlag columns, attempting to load Makou discharge NC...")
+    
+    date_nc, discharge_nc = find_makou_files()
+
+    with xr.open_dataset(date_nc) as ds_date:
+        datenum_vals = ds_date['datenum'].values
+        
+    with xr.open_dataset(discharge_nc) as ds_q:
+        discharge_vals = ds_q['discharge'].values
+        
+    dates = pd.to_datetime(datenum_vals - MATLAB_EPOCH_OFFSET, unit='D', origin='unix').normalize()
+    
+    dfq = pd.DataFrame({'date': dates, 'Q': np.ravel(discharge_vals)}) \
+            .sort_values('date') \
+            .drop_duplicates('date') \
+            .reset_index(drop=True)
+            
+    full_idx = pd.date_range(dfq['date'].min(), dfq['date'].max(), freq='D')
+    dfq = dfq.set_index('date').reindex(full_idx).reset_index()
+    dfq.columns = ['date', 'Q']
+    
+    neg_mask = dfq['Q'] <= 0
+    n_neg = int(neg_mask.sum())
+    if n_neg > 0:
+        dfq.loc[neg_mask, 'Q'] = np.nan
+        dfq['Q'] = dfq['Q'].interpolate(method='linear')
+        
+    dfq['Qlag1'] = dfq['Q'].shift(1)
+    dfq['Qlag3'] = dfq['Q'].rolling(3, min_periods=1).mean().shift(1)
+    dfq['Qlag7'] = dfq['Q'].rolling(7, min_periods=1).mean().shift(1)
+    dfq['logQlag3'] = np.log1p(dfq['Qlag3'])
+    
+    dfq = dfq.dropna(subset=['Qlag1', 'Qlag3', 'Qlag7']).reset_index(drop=True)
+    
+    print(f"negative-Q count (fixed): {n_neg}")
+    for col in ['Qlag1', 'Qlag3', 'Qlag7']:
+        print(f"  {col:8s} min={int(dfq[col].min())} median={int(dfq[col].median())} max={int(dfq[col].max())} m3/s")
+    
+    valid_days = int(dfq['date'].dt.year.isin(range(2017, 2024)).sum())
+    print(f"2017-2023 valid days: {valid_days}")
+    return dfq
+
+def merge_qlag_features(df, dfq):
+    df = df.copy()
+    if 'Date' in df.columns and 'date' not in df.columns:
+        df['date'] = pd.to_datetime(df['Date'], errors='coerce').dt.normalize()
+    else:
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.normalize()
+        
+    n_before = len(df)
+    df = df.merge(
+        dfq[['date', 'Qlag1', 'Qlag3', 'Qlag7', 'logQlag3']],
+        on='date',
+        how='inner'
+    )
+    month = df['date'].dt.month
+    df['month_sin'] = np.sin(2 * np.pi * month / 12.0)
+    df['month_cos'] = np.cos(2 * np.pi * month / 12.0)
+    df['Year'] = df['date'].dt.year.astype(int)
+    
+    if 'Date' not in df.columns:
+        df['Date'] = df['date']
+        
+    print(f"Qlag merge: before={n_before}, after={len(df)}, dropped={n_before - len(df)}")
+    if len(df) > 0:
+        print(f"merged year range: {df['Year'].min()}-{df['Year'].max()}")
+    return df
+
+# ==========================================
+# Feature engineering
+# ==========================================
+def clean_and_engineer_features(df):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    
+    for c in df.columns:
+        if df.columns.tolist().count(c) > 1:
+            df = df.loc[:, ~df.columns.duplicated()]
+            
+    df = standardize_reflectance_columns(df)
+    df = ensure_datetime(df, 'Date')
+    df = unify_swir1_column(df)
+    
+    required_cols = ['Date', 'SS', 'rhorc_Blue', 'rhorc_Green', 'rhorc_Red', 'logQlag3', 'Qlag1', 'Qlag7']
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns: {missing}")
+        
+    for col in ['SS', 'rhorc_Blue', 'rhorc_Green', 'rhorc_Red', 'logQlag3', 'Qlag1', 'Qlag7']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+    df['month_sin'] = np.sin(2 * np.pi * df['Date'].dt.month / 12.0)
+    df['month_cos'] = np.cos(2 * np.pi * df['Date'].dt.month / 12.0)
+    
+    df['ratioRG'] = df['rhorc_Red'] / (df['rhorc_Green'] + EPS)
+    df['ratioRB'] = df['rhorc_Red'] / (df['rhorc_Blue'] + EPS)
+    df['ratioGB'] = df['rhorc_Green'] / (df['rhorc_Blue'] + EPS)
+    
+    # REMOVED ratioRS1G per v18c spec
+    features = [
+        'rhorc_Blue', 'rhorc_Green', 'rhorc_Red',
+        'ratioRG', 'ratioRB', 'ratioGB', 
+        'logQlag3', 'Qlag1', 'Qlag7',
+        'month_sin', 'month_cos'
+    ]
+    
+    keep_cols = ['Date', 'SS'] + features
+    df = df[keep_cols].copy()
+    
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=keep_cols).copy()
+    df = df[df['SS'] > 0].copy()
+    df['Year'] = df['Date'].dt.year.astype(int)
+    
+    df = df.sort_values('Date').reset_index(drop=True)
+    
+    print(f"len(df)={len(df)} samples, len(features)={len(features)}")
+    print(f"Features : {features}")
+    print("SS : min={:.2f} median={:.2f} mean={:.2f} max={:.2f} mg/L".format(
+        df['SS'].min(), df['SS'].median(), df['SS'].mean(), df['SS'].max()
+    ))
+    
+    return df, features
+
+
+# ==========================================
+# Models
+# ==========================================
+def build_model(model_name):
+    if model_name == 'RandomForest':
+        return RandomForestRegressor(
+            n_estimators=600, max_depth=None, min_samples_split=4, min_samples_leaf=2,
+            max_features='sqrt', n_jobs=-1, random_state=RANDOM_STATE
+        )
+    elif model_name == 'XGBoost':
+        return xgb.XGBRegressor(
+            n_estimators=1200, learning_rate=0.03, max_depth=3, min_child_weight=3,
+            subsample=0.85, colsample_bytree=0.85, reg_alpha=0.0, reg_lambda=2.0,
+            objective='reg:squarederror', random_state=RANDOM_STATE, tree_method='hist',
+            early_stopping_rounds=50
+        )
+    elif model_name == 'LightGBM':
+        return lgb.LGBMRegressor(
+            n_estimators=1200, learning_rate=0.03, num_leaves=31, max_depth=-1,
+            min_child_samples=10, subsample=0.85, colsample_bytree=0.85,
+            reg_alpha=0.0, reg_lambda=2.0, objective='regression',
+            random_state=RANDOM_STATE, verbose=-1
+        )
+    elif model_name == 'CatBoost':
+        return CatBoostRegressor(
+            iterations=1200, learning_rate=0.03, depth=6, l2_leaf_reg=5.0,
+            loss_function='RMSE', random_seed=RANDOM_STATE, verbose=False
+        )
+    elif model_name == 'SVR':
+        return Pipeline([
+            ('scaler', StandardScaler()),
+            ('svr', SVR(C=10.0, epsilon=0.2, gamma='scale', kernel='rbf'))
+        ])
+    else:
+        raise ValueError(f"Unknown model_name: {model_name}")
+
+def fit_with_inner_validation(model_name, X_train, y_train):
+    model = build_model(model_name)
+    use_inner_val = model_name in ['XGBoost', 'LightGBM', 'CatBoost'] and len(X_train) > 25
+    
+    if use_inner_val:
+        X_sub, X_val, y_sub, y_val = train_test_split(
+            X_train, y_train, test_size=0.2, random_state=RANDOM_STATE
+        )
+        if model_name == 'XGBoost':
+            model.fit(X_sub, y_sub, eval_set=[(X_val, y_val)], verbose=False)
+        elif model_name == 'LightGBM':
+            model.fit(
+                X_sub, y_sub, eval_set=[(X_val, y_val)], eval_metric='l2',
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
+        elif model_name == 'CatBoost':
+            model.fit(X_sub, y_sub, eval_set=(X_val, y_val), use_best_model=True, verbose=False)
+    else:
+        model.fit(X_train, y_train)
+        
+    return model
+
+def fit_full_model(model_name, X_all, y_all):
+    return fit_with_inner_validation(model_name, X_all, y_all)
+
+
+# ==========================================
+# Plotting
+# ==========================================
+def plot_scatter(y_true, y_pred, years, model_name, out_png):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    years = np.asarray(years)
+    r2 = safe_r2(y_true, y_pred)
+    the_rmse = rmse(y_true, y_pred)
+    the_mae = mae(y_true, y_pred)
+    
+    uniq_years = sorted(pd.unique(years))
+    cmap = plt.get_cmap('tab10')
+    color_map = {yr: cmap(i % 10) for i, yr in enumerate(uniq_years)}
+    
+    fig, ax = plt.subplots(figsize=(6.8, 6.2))
+    for yr in uniq_years:
+        m = (years == yr)
+        ax.scatter(
+            y_true[m], y_pred[m], s=28, alpha=0.72,
+            color=color_map[yr], label=str(yr), edgecolor='white', linewidth=0.4
+        )
+        
+    vmax = max(float(np.max(y_true)), float(np.max(y_pred))) * 1.05
+    vmax = max(vmax, 10)
+    
+    ax.plot([0, vmax], [0, vmax], '--', color='black', lw=1.2)
+    ax.set_xlim(0, vmax)
+    ax.set_ylim(0, vmax)
+    ax.set_xlabel('Observed SS (mg/L)')
+    ax.set_ylabel('Predicted SS (mg/L)')
+    ax.set_title(f"{model_name} LOYO Scatter ({VERSION})")
+    
+    text = f"R² = {r2:.3f}\nRMSE = {the_rmse:.2f} mg/L\nMAE = {the_mae:.2f} mg/L\nN = {len(y_true)}"
+    ax.text(
+        0.04, 0.96, text, transform=ax.transAxes, va='top', ha='left',
+        fontsize=10, bbox=dict(boxstyle='round', fc='white', ec='0.7', alpha=0.9)
+    )
+    
+    ax.grid(alpha=0.25)
+    ax.legend(loc='lower right', fontsize=8, ncol=2, frameon=True)
+    plt.tight_layout()
+    plt.savefig(out_png, bbox_inches='tight')
+    plt.close(fig)
+
+def plot_model_comparison(stats_df, out_png):
+    dfp = stats_df.sort_values('R2_LOYO', ascending=False).reset_index(drop=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.8))
+    
+    axes[0].bar(dfp['Model'], dfp['R2_LOYO'], color='#4C78A8')
+    axes[0].set_title(f"LOYO R² ({VERSION})")
+    axes[0].set_ylabel('R²')
+    axes[0].grid(axis='y', alpha=0.25)
+    for i, v in enumerate(dfp['R2_LOYO']):
+        axes[0].text(i, v + 0.01, f"{v:.3f}", ha='center', va='bottom', fontsize=9)
+        
+    axes[1].bar(dfp['Model'], dfp['RMSE_LOYO'], color='#F58518')
+    axes[1].set_title(f"LOYO RMSE ({VERSION})")
+    axes[1].set_ylabel('RMSE (mg/L)')
+    axes[1].grid(axis='y', alpha=0.25)
+    for i, v in enumerate(dfp['RMSE_LOYO']):
+        axes[1].text(i, v + 0.05, f"{v:.2f}", ha='center', va='bottom', fontsize=9)
+        
+    for ax in axes:
+        ax.tick_params(axis='x', rotation=20)
+        
+    plt.tight_layout()
+    plt.savefig(out_png, bbox_inches='tight')
+    plt.close(fig)
+
+
+# ==========================================
+# LOYO runner
+# ==========================================
+def run_loyo_all_models(df, features):
+    years = sorted(df['Year'].unique().tolist())
+    
+    print("-" * 60)
+    print(f"{VERSION.upper()} LOYO-CV (No ratioRS1G)")
+    print("-" * 60)
+    
+    print(f"{VERSION.upper()} LOYO fold counts:")
+    counts = df['Year'].value_counts().sort_index()
+    max_count = counts.max()
+    for yr, n in counts.items():
+        bar = "#" * max(1, int(round(n / max_count * 15)))
+        print(f"  {yr}: {n:3d} {bar}")
+    print(f"  (fold count min={counts.min()} max={counts.max()})\n")
+    
+    model_stats = []
+    all_pred_records = []
+    full_models = {}
+    
+    X_all = df[features].copy()
+    y_all = df[TARGET].copy()
+    
+    for model_name in MODEL_ORDER:
+        print(f"[{model_name}] ({len(years)} folds)...")
+        t_model_start = time.time()
+        
+        fold_rows = []
+        y_true_all, y_pred_all, year_all = [], [], []
+        
+        for i, test_year in enumerate(years, start=1):
+            fold_start = time.time()
+            
+            train_df = df[df['Year'] != test_year].copy()
+            test_df = df[df['Year'] == test_year].copy()
+            
+            X_train = train_df[features].values
+            y_train = train_df[TARGET].values
+            X_test = test_df[features].values
+            y_test = test_df[TARGET].values
+            
+            model = fit_with_inner_validation(model_name, X_train, y_train)
+            y_pred = clip_nonnegative(model.predict(X_test))
+            
+            fold_r2 = safe_r2(y_test, y_pred)
+            fold_rmse = rmse(y_test, y_pred)
+            fold_mae = mae(y_test, y_pred)
+            fold_time = time.time() - fold_start
+            
+            print(f"  fold {i:2d}/{len(years)} (year {test_year}, n={len(test_df):3d}): R2={fold_r2:6.3f} RMSE={fold_rmse:5.2f} MAE={fold_mae:5.2f} ({fold_time:4.1f}s)")
+            
+            fold_rows.append({
+                'Model': model_name, 'Year': int(test_year), 'n_test': int(len(test_df)),
+                'R2': fold_r2, 'RMSE': fold_rmse, 'MAE': fold_mae, 'FoldTime_s': fold_time
+            })
+            
+            pred_fold = test_df[['Date', 'Year', 'SS']].copy()
+            pred_fold['Model'] = model_name
+            pred_fold['Pred_SS'] = y_pred
+            pred_fold['AbsErr'] = np.abs(pred_fold['Pred_SS'] - pred_fold['SS'])
+            all_pred_records.append(pred_fold)
+            
+            y_true_all.extend(y_test.tolist())
+            y_pred_all.extend(y_pred.tolist())
+            year_all.extend([test_year] * len(test_df))
+            
+        fold_df = pd.DataFrame(fold_rows)
+        
+        full_model = fit_full_model(model_name, X_all.values, y_all.values)
+        full_models[model_name] = deepcopy(full_model)
+        
+        train_pred = clip_nonnegative(full_model.predict(X_all.values))
+        train_r2 = safe_r2(y_all.values, train_pred)
+        
+        loyo_r2 = safe_r2(y_true_all, y_pred_all)
+        loyo_rmse = rmse(y_true_all, y_pred_all)
+        loyo_mae = mae(y_true_all, y_pred_all)
+        overfit_gap = train_r2 - loyo_r2
+        total_time = time.time() - t_model_start
+        
+        scatter_png = os.path.join(OUTPUT_DIR, f"scatter_{model_name.lower()}_{VERSION}_loyo.png")
+        plot_scatter(
+            y_true=np.array(y_true_all), y_pred=np.array(y_pred_all),
+            years=np.array(year_all), model_name=model_name, out_png=scatter_png
+        )
+        
+        model_stats.append({
+            'Model': model_name, 'R2_Train': train_r2, 'R2_LOYO': loyo_r2,
+            'Overfit_Gap': overfit_gap, 'RMSE_LOYO': loyo_rmse, 'MAE_LOYO': loyo_mae,
+            'TrainTime_s': total_time
+        })
+        
+        print(f"  -> {model_name} Train R²={train_r2:.3f} | LOYO R²={loyo_r2:.3f} (Gap={overfit_gap:.3f}) | RMSE={loyo_rmse:.2f} MAE={loyo_mae:.2f} | total={total_time:.0f}s\n")
+        
+        fold_csv = os.path.join(OUTPUT_DIR, f"fold_metrics_{model_name.lower()}_{VERSION}.csv")
+        fold_df.to_csv(fold_csv, index=False)
+        
+    stats_df = pd.DataFrame(model_stats).sort_values(['R2_LOYO', 'RMSE_LOYO'], ascending=[False, True]).reset_index(drop=True)
+    pred_df = pd.concat(all_pred_records, axis=0).reset_index(drop=True)
+    pred_df = pred_df.sort_values(['Model', 'Date']).reset_index(drop=True)
+    
+    stats_csv = os.path.join(OUTPUT_DIR, f"model_stats_{VERSION}_full.csv")
+    preds_csv = os.path.join(OUTPUT_DIR, f"all_predictions_{VERSION}_loyo.csv")
+    comp_png = os.path.join(OUTPUT_DIR, f"model_comparison_{VERSION}.png")
+    
+    stats_df.to_csv(stats_csv, index=False)
+    pred_df.to_csv(preds_csv, index=False)
+    plot_model_comparison(stats_df, comp_png)
+    
+    champion = stats_df.iloc[0]['Model']
+    champion_model = full_models[champion]
+    champion_path = os.path.join(OUTPUT_DIR, f"champion_{champion}_{VERSION}.pkl")
+    
+    joblib.dump({
+        'version': VERSION, 'model_name': champion, 'model': champion_model,
+        'features': features, 'target': TARGET, 'years': sorted(df['Year'].unique().tolist()),
+        'n_samples': int(len(df)), 'train_date_min': str(df['Date'].min().date()),
+        'train_date_max': str(df['Date'].max().date()),
+        'stat_table': stats_df.to_dict(orient='records')
+    }, champion_path)
+    
+    print("-" * 60)
+    print(f"{VERSION.upper()} LOYO summary:")
+    print(stats_df.to_string(index=False))
+    print("-" * 60)
+    print(f"stats_csv      : {stats_csv}")
+    print(f"preds_csv      : {preds_csv}")
+    print(f"[{VERSION.upper()}] champion : {champion_path}")
+    print(f"comparison_png : {comp_png}")
+    
+    return stats_df, pred_df
+
+
+# ==========================================
+# Main
+# ==========================================
+def main():
+    print(f"{VERSION.upper()}")
+    print(f"BASE_DIR   : {BASE_DIR}")
+    print(f"OUTPUT_DIR : {OUTPUT_DIR}\n")
+    
+    csv_path = choose_existing_path(CSV_CANDIDATES)
+    print(f"Using CSV : {csv_path}")
+    
+    df = pd.read_csv(csv_path)
+    df = standardize_reflectance_columns(df)
+    df = collapse_duplicate_columns(df)
+    
+    need_q = any(c not in df.columns for c in ["logQlag3", "Qlag1", "Qlag7"])
+    if need_q:
+        dfq = load_makou_qlag()
+        df = merge_qlag_features(df, dfq)
+        
+    df, features = clean_and_engineer_features(df)
+    
+    print(f"{VERSION.upper()}-MOD: removed ratioRS1G")
+    run_loyo_all_models(df, features)
+    print(f"\n{VERSION.upper()}, done.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+---------------
+
+V18C
+BASE_DIR   : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1
+OUTPUT_DIR : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1/inversion_v18c_loyo_no_ratioRS1G
+
+Using CSV : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260518_v1/inversion_v13_multimodel/matched_data_20172023_CV_filtered_v13.csv
+CSV lacks Qlag columns, attempting to load Makou discharge NC...
+negative-Q count (fixed): 0
+  Qlag1    min=60 median=4740 max=45200 m3/s
+  Qlag3    min=422 median=4783 max=43600 m3/s
+  Qlag7    min=851 median=4818 max=40385 m3/s
+2017-2023 valid days: 2556
+Qlag merge: before=634, after=634, dropped=0
+merged year range: 2017-2023
+len(df)=634 samples, len(features)=11
+Features : ['rhorc_Blue', 'rhorc_Green', 'rhorc_Red', 'ratioRG', 'ratioRB', 'ratioGB', 'logQlag3', 'Qlag1', 'Qlag7', 'month_sin', 'month_cos']
+SS : min=0.60 median=5.60 mean=8.03 max=98.00 mg/L
+V18C-MOD: removed ratioRS1G
+------------------------------------------------------------
+V18C LOYO-CV (No ratioRS1G)
+------------------------------------------------------------
+V18C LOYO fold counts:
+  2017:  83 ##########
+  2018:  92 ###########
+  2019: 122 ###############
+  2020:  45 ######
+  2021: 105 #############
+  2022:  94 ############
+  2023:  93 ###########
+  (fold count min=45 max=122)
+
+[RandomForest] (7 folds)...
+  fold  1/7 (year 2017, n= 83): R2= 0.485 RMSE= 6.43 MAE= 4.78 ( 1.4s)
+  fold  2/7 (year 2018, n= 92): R2=-0.008 RMSE= 6.37 MAE= 3.80 ( 1.4s)
+  fold  3/7 (year 2019, n=122): R2= 0.527 RMSE= 8.90 MAE= 5.06 ( 1.4s)
+  fold  4/7 (year 2020, n= 45): R2= 0.492 RMSE= 8.30 MAE= 6.37 ( 1.4s)
+  fold  5/7 (year 2021, n=105): R2=-0.228 RMSE= 4.31 MAE= 3.33 ( 1.4s)
+  fold  6/7 (year 2022, n= 94): R2= 0.520 RMSE= 7.35 MAE= 4.34 ( 1.4s)
+  fold  7/7 (year 2023, n= 93): R2= 0.494 RMSE= 5.72 MAE= 3.27 ( 1.4s)
+  -> RandomForest Train R²=0.868 | LOYO R²=0.471 (Gap=0.397) | RMSE=6.88 MAE=4.28 | total=11s
+
+[XGBoost] (7 folds)...
+  fold  1/7 (year 2017, n= 83): R2= 0.501 RMSE= 6.33 MAE= 4.56 ( 0.8s)
+  fold  2/7 (year 2018, n= 92): R2= 0.128 RMSE= 5.93 MAE= 3.74 ( 0.2s)
+  fold  3/7 (year 2019, n=122): R2= 0.521 RMSE= 8.96 MAE= 5.18 ( 0.5s)
+  fold  4/7 (year 2020, n= 45): R2= 0.510 RMSE= 8.15 MAE= 6.04 ( 0.2s)
+  fold  5/7 (year 2021, n=105): R2=-0.475 RMSE= 4.72 MAE= 3.48 ( 0.4s)
+  fold  6/7 (year 2022, n= 94): R2= 0.516 RMSE= 7.38 MAE= 4.27 ( 0.2s)
+  fold  7/7 (year 2023, n= 93): R2= 0.506 RMSE= 5.65 MAE= 3.40 ( 0.2s)
+  -> XGBoost Train R²=0.917 | LOYO R²=0.475 (Gap=0.442) | RMSE=6.85 MAE=4.27 | total=4s
+
+[LightGBM] (7 folds)...
+  fold  1/7 (year 2017, n= 83): R2= 0.394 RMSE= 6.98 MAE= 4.79 ( 3.0s)
+  fold  2/7 (year 2018, n= 92): R2=-0.011 RMSE= 6.38 MAE= 3.80 ( 0.5s)
+  fold  3/7 (year 2019, n=122): R2= 0.466 RMSE= 9.46 MAE= 5.15 ( 0.8s)
+  fold  4/7 (year 2020, n= 45): R2= 0.500 RMSE= 8.23 MAE= 6.48 ( 0.8s)
+  fold  5/7 (year 2021, n=105): R2=-0.396 RMSE= 4.60 MAE= 3.63 ( 0.4s)
+  fold  6/7 (year 2022, n= 94): R2= 0.531 RMSE= 7.26 MAE= 4.21 ( 0.4s)
+  fold  7/7 (year 2023, n= 93): R2= 0.476 RMSE= 5.82 MAE= 3.38 ( 0.6s)
+  -> LightGBM Train R²=0.798 | LOYO R²=0.434 (Gap=0.363) | RMSE=7.11 MAE=4.35 | total=8s
+
+[CatBoost] (7 folds)...
+  fold  1/7 (year 2017, n= 83): R2= 0.606 RMSE= 5.63 MAE= 4.52 ( 3.1s)
+  fold  2/7 (year 2018, n= 92): R2= 0.228 RMSE= 5.58 MAE= 3.56 ( 3.3s)
+  fold  3/7 (year 2019, n=122): R2= 0.465 RMSE= 9.47 MAE= 5.39 ( 3.3s)
+  fold  4/7 (year 2020, n= 45): R2= 0.325 RMSE= 9.57 MAE= 7.10 ( 3.5s)
+  fold  5/7 (year 2021, n=105): R2=-0.221 RMSE= 4.30 MAE= 3.36 ( 3.1s)
+  fold  6/7 (year 2022, n= 94): R2= 0.480 RMSE= 7.65 MAE= 4.32 ( 3.0s)
+  fold  7/7 (year 2023, n= 93): R2= 0.435 RMSE= 6.05 MAE= 3.49 ( 3.1s)
+  -> CatBoost Train R²=0.931 | LOYO R²=0.446 (Gap=0.485) | RMSE=7.04 MAE=4.36 | total=25s
+
+[SVR] (7 folds)...
+  fold  1/7 (year 2017, n= 83): R2= 0.476 RMSE= 6.48 MAE= 4.56 ( 0.0s)
+  fold  2/7 (year 2018, n= 92): R2= 0.371 RMSE= 5.03 MAE= 3.54 ( 0.0s)
+  fold  3/7 (year 2019, n=122): R2= 0.438 RMSE= 9.71 MAE= 4.98 ( 0.0s)
+  fold  4/7 (year 2020, n= 45): R2= 0.312 RMSE= 9.66 MAE= 6.34 ( 0.0s)
+  fold  5/7 (year 2021, n=105): R2=-0.036 RMSE= 3.96 MAE= 3.00 ( 0.0s)
+  fold  6/7 (year 2022, n= 94): R2= 0.431 RMSE= 8.00 MAE= 4.08 ( 0.0s)
+  fold  7/7 (year 2023, n= 93): R2= 0.536 RMSE= 5.48 MAE= 3.14 ( 0.0s)
+  -> SVR Train R²=0.596 | LOYO R²=0.436 (Gap=0.159) | RMSE=7.10 MAE=4.08 | total=0s
+
+------------------------------------------------------------
+V18C LOYO summary:
+       Model  R2_Train  R2_LOYO  Overfit_Gap  RMSE_LOYO  MAE_LOYO  TrainTime_s
+     XGBoost  0.917172 0.474854     0.442318   6.853486  4.271595     3.728651
+RandomForest  0.868036 0.470641     0.397395   6.880927  4.277456    11.128270
+    CatBoost  0.931372 0.446434     0.484938   7.036493  4.359538    25.201551
+         SVR  0.595601 0.436372     0.159229   7.100156  4.079659     0.191862
+    LightGBM  0.797539 0.434084     0.363455   7.114552  4.352739     7.777095
+------------------------------------------------------------
+stats_csv      : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1/inversion_v18c_loyo_no_ratioRS1G/model_stats_v18c_full.csv
+preds_csv      : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1/inversion_v18c_loyo_no_ratioRS1G/all_predictions_v18c_loyo.csv
+[V18C] champion : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1/inversion_v18c_loyo_no_ratioRS1G/champion_XGBoost_v18c.pkl
+comparison_png : /public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/inversion_20260520_v1/inversion_v18c_loyo_no_ratioRS1G/model_comparison_v18c.png
+
+V18C, done.
+
+
+-------------------------
+
+%% ============================================================
+%  corr_discharge_sand_threestations.m  V3
+%  修改说明：
+%    1. Makou 独立时间序列图单独加载 2006-2023 discharge，
+%       x 轴延伸到 2023 年底，sand 画到数据末尾
+%    2. 其余逻辑不变
+%% ============================================================
+
+clear; clc;
+
+%% ---- Path configuration ----
+DISC_DIR  = '/public/zengxiyuan/data/PRE/all-nc-discharge-sand-2006-2022/discharge-2006-2022-nc';
+SAND_DIR  = '/public/zengxiyuan/data/PRE/all-nc-discharge-sand-2006-2022/sand-2006-2022-nc';
+OUT_DIR   = '/public1/zengxiyuan/hima/HKEPB/data-extracted-zxy/PRE_discharge/plots/corr_Q_S';
+
+if ~exist(OUT_DIR, 'dir')
+    mkdir(OUT_DIR);
+    fprintf('Created output directory: %s\n', OUT_DIR);
+end
+
+%% ---- Station definitions ----
+stations = {
+    'Boluo',   'boluo-date-2006-2022.nc',   'boluo-discharge-2006-2022.nc',   'boluo-date-2006-2021.nc',   'boluo-sand-2006-2021.nc';
+    'Makou',   'makou-date-2006-2023.nc',   'makou-discharge-2006-2023.nc',   'makou-date-2005-2021.nc',   'makou-sand-2005-2021.nc';
+    'Sanshui', 'sanshui-date-2006-2022.nc', 'sanshui-discharge-2006-2022.nc', 'sanshui-date-2005-2021.nc', 'sanshui-sand-2005-2021.nc';
+};
+
+%% ---- Loop over stations ----
+for i = 1:size(stations, 1)
+
+    sta_name       = stations{i, 1};
+    disc_date_file = stations{i, 2};
+    disc_data_file = stations{i, 3};
+    sand_date_file = stations{i, 4};
+    sand_data_file = stations{i, 5};
+
+    fprintf('\n====== Processing station: %s ======\n', sta_name);
+
+    %% -- Load discharge --
+    disc_datenum = ncread(fullfile(DISC_DIR, disc_date_file), 'datenum');
+    disc_val     = ncread(fullfile(DISC_DIR, disc_data_file), 'discharge');
+    disc_dates   = dateshift(datetime(disc_datenum, 'ConvertFrom', 'datenum'), 'start', 'day');
+
+    %% -- Load sediment --
+    sand_datenum = ncread(fullfile(SAND_DIR, sand_date_file), 'datenum');
+    sand_val     = ncread(fullfile(SAND_DIR, sand_data_file), 'sand');
+    sand_dates   = dateshift(datetime(sand_datenum, 'ConvertFrom', 'datenum'), 'start', 'day');
+
+    fprintf('  Discharge: %s ~ %s  (%d days)\n', ...
+        datestr(disc_dates(1)), datestr(disc_dates(end)), numel(disc_dates));
+    fprintf('  Sediment:  %s ~ %s  (%d days)\n', ...
+        datestr(sand_dates(1)), datestr(sand_dates(end)), numel(sand_dates));
+
+    %% -- Temporal alignment for correlation / three-panel figure --
+    [common_dates, ia, ib] = intersect(disc_dates, sand_dates);
+    Q = disc_val(ia);
+    S = sand_val(ib);
+
+    fprintf('  Overlapping period: %s ~ %s  (%d days)\n', ...
+        datestr(common_dates(1)), datestr(common_dates(end)), numel(common_dates));
+
+    %% -- Remove NaN / non-positive values --
+    valid = ~isnan(Q) & ~isnan(S) & (Q > 0) & (S > 0);
+    Q = Q(valid);
+    S = S(valid);
+    t = common_dates(valid);
+    fprintf('  Valid samples after quality control: %d days\n', sum(valid));
+
+    %% -- Correlation statistics --
+    [R_p,  P_p]  = corrcoef(Q, S);
+    r_pearson    = R_p(1,2);
+    p_pearson    = P_p(1,2);
+
+    [r_spearman, p_spearman] = corr(Q, S, 'Type', 'Spearman');
+
+    [R_log, P_log] = corrcoef(log(Q), log(S));
+    r_log   = R_log(1,2);
+    p_log   = P_log(1,2);
+    p_fit   = polyfit(log10(Q), log10(S), 1);
+
+    fprintf('  Pearson  r = %.4f  (p = %.2e)\n', r_pearson,  p_pearson);
+    fprintf('  Spearman r = %.4f  (p = %.2e)\n', r_spearman, p_spearman);
+    fprintf('  log-log Pearson r = %.4f  (p = %.2e)  slope = %.3f\n', r_log, p_log, p_fit(1));
+
+    %% ============================================================
+    %  独立时间序列图
+    %  [Makou 特殊处理] discharge 用完整 2006-2023 数据，
+    %  sand 用到其数据末尾，x 轴统一延伸到 2023-12-31
+    %% ============================================================
+    fig_ts = figure('Position', [100 100 1400 450], 'Visible', 'off');
+    ax_ts  = axes(fig_ts);
+
+    if strcmp(sta_name, 'Makou')
+        % --- Discharge：直接用已加载的完整 2006-2023 数据 ---
+        disc_val_ts  = disc_val;
+        disc_dates_ts = disc_dates;
+
+        % --- Sand：用已加载数据，不做截断，直接到数据末尾 ---
+        % 对 sand 中的 NaN/负值做标记但不剔除（保留时间轴完整性）
+        sand_val_ts  = sand_val;
+        sand_dates_ts = sand_dates;
+        sand_val_plot = double(sand_val_ts);
+        sand_val_plot(sand_val_ts <= 0) = NaN;   % 非正值置 NaN，不显示
+
+        % --- 统一 x 轴范围 ---
+        x_start = datetime(2006, 1, 1);
+        x_end   = datetime(2023, 12, 31);
+
+        yyaxis(ax_ts, 'left');
+        plot(ax_ts, disc_dates_ts, disc_val_ts, 'b-', 'LineWidth', 0.8);
+        ylabel(ax_ts, 'River Discharge (m^{3}/s)', 'FontSize', 12);
+        ax_ts.YAxis(1).Color = 'b';
+
+        yyaxis(ax_ts, 'right');
+        plot(ax_ts, sand_dates_ts, sand_val_plot, 'r-', 'LineWidth', 0.8);
+        ylabel(ax_ts, 'Sediment Transport (kg/s)', 'FontSize', 12);
+        ax_ts.YAxis(2).Color = 'r';
+
+        xlim(ax_ts, [x_start, x_end]);
+        xlabel(ax_ts, 'Date', 'FontSize', 12);
+
+        % 标题注明 discharge 到 2023，sand 只到 2021
+        sand_end_str = datestr(sand_dates_ts(end), 'yyyy-mm');
+        title(ax_ts, sprintf('Makou Station  Time Series  (Discharge: 2006-2023 | Sediment: 2006-%s)', ...
+              sand_end_str), 'FontSize', 13, 'FontWeight', 'bold');
+
+        % 图例加注说明
+        legend(ax_ts, ...
+               {'Discharge (2006-2023)', sprintf('Sediment (up to %s)', sand_end_str)}, ...
+               'Location', 'northwest', 'FontSize', 10);
+
+        % [新增] 在 sand 数据末尾加一条竖线，明确标注 sand 截止位置
+        hold(ax_ts, 'on');
+        yyaxis(ax_ts, 'left');   % 切回左轴，用左轴坐标画竖线
+        y_lims = ylim(ax_ts);
+        xline(ax_ts, sand_dates_ts(end), '--', ...
+              sprintf('Sediment ends %s', datestr(sand_dates_ts(end),'yyyy-mm-dd')), ...
+              'Color', [0.6 0.0 0.0], 'LineWidth', 1.2, ...
+              'LabelVerticalAlignment', 'top', ...
+              'LabelHorizontalAlignment', 'left', ...
+              'FontSize', 9);
+        hold(ax_ts, 'off');
+
+    else
+        % --- 其他站：维持原逻辑，discharge 和 sand 取交集后绘图 ---
+        yyaxis(ax_ts, 'left');
+        plot(ax_ts, t, Q, 'b-', 'LineWidth', 0.8);
+        ylabel(ax_ts, 'River Discharge (m^{3}/s)', 'FontSize', 12);
+        ax_ts.YAxis(1).Color = 'b';
+
+        yyaxis(ax_ts, 'right');
+        plot(ax_ts, t, S, 'r-', 'LineWidth', 0.8);
+        ylabel(ax_ts, 'Sediment Transport (kg/s)', 'FontSize', 12);
+        ax_ts.YAxis(2).Color = 'r';
+
+        xlabel(ax_ts, 'Date', 'FontSize', 12);
+        title(ax_ts, sprintf('%s Station  Time Series (2006-2022)', sta_name), ...
+              'FontSize', 13, 'FontWeight', 'bold');
+        legend(ax_ts, {'Discharge', 'Sediment'}, 'Location', 'northwest', 'FontSize', 10);
+    end
+
+    grid(ax_ts, 'on');
+
+    out_ts = fullfile(OUT_DIR, sprintf('%s_timeseries_standalone.png', lower(sta_name)));
+    exportgraphics(fig_ts, out_ts, 'Resolution', 250);
+    close(fig_ts);
+    fprintf('  Time series figure saved -> %s\n', out_ts);
+
+    %% ============================================================
+    %  三联图（相关性分析，用交集数据，逻辑不变）
+    %% ============================================================
+    fig = figure('Position', [100 100 1300 430], 'Visible', 'off');
+
+    % Subplot 1: Time series
+    ax1 = subplot(1, 3, 1);
+    yyaxis(ax1, 'left');
+    plot(ax1, t, Q, 'b-', 'LineWidth', 0.7);
+    ylabel(ax1, 'River Discharge (m^{3}/s)', 'FontSize', 9);
+    ax1.YAxis(1).Color = 'b';
+    yyaxis(ax1, 'right');
+    plot(ax1, t, S, 'r-', 'LineWidth', 0.7);
+    ylabel(ax1, 'Sediment Transport (kg/s)', 'FontSize', 9);
+    ax1.YAxis(2).Color = 'r';
+    xlabel(ax1, 'Date', 'FontSize', 9);
+    title(ax1, sprintf('%s Station  Time Series', sta_name), 'FontSize', 11);
+    legend(ax1, {'Discharge', 'Sediment'}, 'Location', 'northwest', 'FontSize', 8);
+    grid(ax1, 'on');
+
+    % Subplot 2: Linear scatter
+    ax2 = subplot(1, 3, 2);
+    scatter(ax2, Q, S, 8, 'filled', 'MarkerFaceAlpha', 0.3, 'MarkerFaceColor', [0.18 0.45 0.72]);
+    xlabel(ax2, 'River Discharge (m^{3}/s)', 'FontSize', 10);
+    ylabel(ax2, 'Sediment Transport (kg/s)', 'FontSize', 10);
+    title(ax2, sprintf('Linear Scatter\nPearson r = %.3f  (p = %.2e)', r_pearson, p_pearson), 'FontSize', 11);
+    grid(ax2, 'on');
+
+    % Subplot 3: log-log scatter + regression line
+    ax3 = subplot(1, 3, 3);
+    scatter(ax3, log10(Q), log10(S), 8, 'filled', 'MarkerFaceAlpha', 0.3, 'MarkerFaceColor', [0.80 0.30 0.10]);
+    hold(ax3, 'on');
+    x_fit = linspace(min(log10(Q)), max(log10(Q)), 200);
+    plot(ax3, x_fit, polyval(p_fit, x_fit), 'k-', 'LineWidth', 1.8);
+    xlabel(ax3, 'log_{10}(Discharge)  [m^{3}/s]', 'FontSize', 10);
+    ylabel(ax3, 'log_{10}(Sediment)  [kg/s]', 'FontSize', 10);
+    title(ax3, sprintf('log-log Scatter\nr = %.3f,  slope = %.2f', r_log, p_fit(1)), 'FontSize', 11);
+    legend(ax3, {'Data', sprintf('Fit: y = %.2fx + %.2f', p_fit(1), p_fit(2))}, ...
+           'Location', 'northwest', 'FontSize', 8);
+    grid(ax3, 'on');
+    hold(ax3, 'off');
+
+    sgtitle(sprintf('Discharge vs. Sediment Transport  %s Station\n(Spearman r = %.3f)', ...
+        sta_name, r_spearman), 'FontSize', 13, 'FontWeight', 'bold');
+
+    out_file = fullfile(OUT_DIR, sprintf('%s_Q_vs_S_correlation.png', lower(sta_name)));
+    exportgraphics(fig, out_file, 'Resolution', 200);
+    close(fig);
+    fprintf('  Figure saved -> %s\n', out_file);
+
+end
+
+fprintf('\nAll stations completed.\n');
+
+
+
+--------------------------------------
+
